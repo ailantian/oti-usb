@@ -1,0 +1,804 @@
+//
+//  benchmark.cpp
+//  Performance benchmark program
+//
+//  Created by software team in Prolific on 10/11/2017.
+//  Copyright (c) 2017 Prolific Corp.. All rights reserved.
+//
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include "libusb.h"
+#include "pl2701.h"
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <stdlib.h>
+#include <pthread.h>
+#if defined(__linux__)
+#include <time.h>
+#elif defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
+#endif
+#include "sys/types.h"
+
+static int gProgRole = PROGRAM_ROLE_UNKNOWN;     // The role which this program play
+static bool gkilled = false;                     // Be true to kill the thread and then exit this program
+static int g_bulk_interface_no = 5;              // The interface No. you wish to claim
+//#define DATA_TRANSFER_SIZE    (512 * 2 * 1024)   // 1 MB bytes for each transfer round
+#define DATA_TRANSFER_SIZE    (256 * 1024)   // 1 MB bytes for each transfer round
+//#define DATA_TRANSFER_SIZE    (1024)   // 1 MB bytes for each transfer round
+#define TRANSFER_ROUND_NO                   5000   // The number of rounds sender will transmit
+//#define TRANSFER_ROUND_NO                   1   // The number of rounds sender will transmit
+
+/*
+   The called function when the process gets the specified signal(s)
+ */
+static void signal_handler(int signum)
+{
+    gkilled = true;
+}
+
+int send_hi_recv(struct libusb_device_handle *dev_handle)
+{
+    int return_code;
+    uint16_t dev_status;
+    memset((void *)&dev_status, 0xFF, 2);
+
+    return_code = libusb_control_transfer(dev_handle, 0x40, 0xe1, 0x8080, 0x0280, (unsigned char *)&dev_status, 2, 500);   
+    if (return_code < 1) {
+        return PL_ERROR_WRONG_STATUS;
+    }
+//    printf("magic reciver control %02d \n",dev_status);
+
+}
+
+int send_hi_sender(struct libusb_device_handle *dev_handle)
+{
+
+    int return_code;
+    uint16_t dev_status;
+    memset((void *)&dev_status, 0xFF, 2);
+    //some strange control ,may be magic sender speed?
+    return_code = libusb_control_transfer(dev_handle, 0x40, 0xe2, 0x8080, 0x0280, (unsigned char *)&dev_status, 2, 500);   
+    if (return_code < 1) {
+        return PL_ERROR_WRONG_STATUS;
+    }
+//    printf("magic sender control %02d \n",dev_status);
+}
+
+// OUT-going transfers (OUT from host PC to USB-device)
+struct libusb_transfer *transfer_out[TRANSFER_ROUND_NO] ;//= NULL;
+
+
+unsigned int transferred_total_size = 0; // Total transfer data in bytes
+unsigned int transferred_transfer = 0; // Total transfer data in bytes
+#if defined(_WIN32)		 
+	DWORD64 start_time;
+	DWORD64 end_time;
+#elif defined(__linux__)
+    struct timespec start_time, end_time, diff_time;
+    double elapsed_time;
+#elif defined(__APPLE__)
+	uint64_t start_time;
+	uint64_t end_time;
+	uint64_t diff_time;
+	mach_timebase_info_data_t info;
+#endif
+
+    libusb_device *gdevice =NULL;   // Structure representing one USB device detected on the system
+
+/*
+ *add async callbacks
+ * */
+// Out Callback
+//   - This is called after the Out transfer has been received by libusb
+void cb_out(struct libusb_transfer *transfer)
+{
+#if 0
+	fprintf(stderr, "cb_out: status =%d, actual_length=%d\n",
+		transfer->status, transfer->actual_length);
+#endif
+    //we submit again.
+//    printf(" on me %s\n",__FUNCTION__);
+    
+    transferred_total_size += transfer->actual_length;
+    transferred_transfer ++;
+    if((transferred_transfer %10000) == 0){
+ #if defined(_WIN32)	
+	end_time = GetTickCount();
+	
+	DOUBLE performance = ((DOUBLE)DATA_TRANSFER_SIZE * TRANSFER_ROUND_NO * 1000) / (end_time - start_time) / 1024;
+	printf("Transferred total size = %u bytes\n", transferred_total_size);
+	printf("TickCount = %lld ms\n", end_time - start_time);
+	printf("Performance = %.2lf KB/s\n", performance);
+#elif defined(__linux__)
+    clock_gettime(CLOCK_REALTIME, &end_time);
+
+	if (end_time.tv_nsec - start_time.tv_nsec < 0)
+    {
+		diff_time.tv_sec = end_time.tv_sec - start_time.tv_sec - 1;
+		diff_time.tv_nsec = 1000000000L + end_time.tv_nsec - start_time.tv_nsec;
+    }
+    else
+    {
+        diff_time.tv_sec = end_time.tv_sec - start_time.tv_sec;
+        diff_time.tv_nsec = end_time.tv_nsec - start_time.tv_nsec;
+    }
+    elapsed_time = (double)diff_time.tv_sec + (double)(diff_time.tv_nsec) / 1000000000L;
+//    printf("DiffTime = %ld %ld\n", diff_time.tv_sec, diff_time.tv_nsec);
+    printf("Transferred %u bytes\n", transferred_total_size);
+    printf("Elapsed Time = %.2lf sec\n", elapsed_time);
+//    printf("Performance = %.2lf KB/s\n", (double)transferred_total_size / elapsed_time / 1024);
+    printf("Performance = %.2lf MB/s\n", (double)transferred_total_size / elapsed_time / 1024/1024.0);
+    //reset data 
+    transferred_total_size = 0;
+    clock_gettime(CLOCK_REALTIME, &start_time);
+#elif defined(__APPLE__)
+	end_time = mach_absolute_time();
+	diff_time = end_time - start_time;
+	diff_time *= info.numer;
+	diff_time /= info.denom;
+	printf("Transferred %u bytes\n", transferred_total_size);
+	printf("Elapsed Time = %.2lf sec\n", (double)diff_time / 1000000000);
+//	printf("Performance = %.2lf KB/s\n", (double)transferred_total_size / ((double)diff_time / 1000000000) / 1024);
+	printf("Performance = %.2lf MB/s\n", (double)transferred_total_size / ((double)diff_time / 1000000000) / 1024/1024.0);
+#endif
+   
+    }
+    //resubmit this transfer again.
+	libusb_submit_transfer(transfer);
+}
+
+// In Callback
+//   - This is called after the command for version is processed.
+//     That is, the data for in_buffer IS AVAILABLE.
+void cb_in(struct libusb_transfer *transfer)
+{
+    //measure the time
+//	clock_gettime(CLOCK_REALTIME, &t2);
+	//submit the next transfer
+//	libusb_submit_transfer(transfer);
+
+
+}
+
+void* event_task(void *param)
+{
+    int return_code;   // Return value of each Prolific API
+
+        while (!gkilled) {
+
+            return_code =  libusb_handle_events_completed(NULL, NULL);
+            if (return_code < 0){   // negative values are errors
+//                exitflag = out_deinit;
+                break;
+            }
+        }
+
+
+
+}
+
+
+
+/*
+   The receiver thread for receiving data
+ */
+void* receiver_task(void *param)
+{
+    int return_code;   // Return value of each Prolific API
+	unsigned char *recvBuf = (unsigned char *)malloc(sizeof(char) * DATA_TRANSFER_SIZE);   // Buffer for receiving data
+    int transferred_size = 0;   // Received data in bytes
+//	unsigned int transferred_total_size = 0; // Total received data in bytes
+    struct libusb_device_handle **dev_handle = (struct libusb_device_handle **)param;   /* Structure of
+		 the opened PL2701 device handle */
+
+    printf("Flush Endpoint IN FIFO first\n");
+    return_code = libusb_bulk_transfer(
+                      *dev_handle,
+		              BULK_INTERFACE5_EP1_IN_ADDR,
+                      recvBuf,
+		              BULK_EP1_FIFO_SIZE,
+                      &transferred_size,
+		              BULK_USB3_TIMEOUT
+                  );
+
+    printf("Start to receive the data\n");
+#if defined(_WIN32)	
+	start_time = GetTickCount();
+#elif defined(__linux__)
+    clock_gettime(CLOCK_REALTIME, &start_time);
+#elif defined(__APPLE__)
+	mach_timebase_info(&info);
+	start_time = mach_absolute_time();
+#endif
+    
+    // This tread continuously receive data from the sender
+#if 0
+    while (!gkilled) {
+		transferred_size = 0;
+
+        // Perform a USB bulk transfer
+        return_code = libusb_bulk_transfer(
+                          *dev_handle,
+			              BULK_INTERFACE5_EP1_IN_ADDR,
+                          recvBuf,
+                          DATA_TRANSFER_SIZE,
+                          &transferred_size,
+			              BULK_USB3_TIMEOUT
+                      );
+
+		transferred_total_size += transferred_size;
+
+        if (return_code == LIBUSB_ERROR_TIMEOUT) {
+            // libusb keep return LIBUSB_ERROR_TIMEOUT if no data were be received, and this thread
+            // keep trying to receive any one
+            continue;
+        } else if (return_code != LIBUSB_SUCCESS) {
+            // Error occurs except LIBUSB_ERROR_TIMEOUT
+            printf("Fail receiving data from bulk, return_code = %d\n", return_code);
+            break;
+        }
+#if 0
+   static int recv_loop = 0; 
+        recv_loop++;
+        
+        if(recv_loop%10){
+        send_hi_recv(*dev_handle);
+        }
+#endif
+#if 0
+        //dump data
+        int i=0;
+        for(i=0;i<DATA_TRANSFER_SIZE;i++)
+            printf("%c",recvBuf[i]);
+        printf("\n");
+#endif
+		//printf("Total received size = %u\n", transferred_total_size); // Don't show this message while doing benchmark or it'll impact the result significantly.
+    }
+#endif
+#if 0
+    //async receve
+        // allocate transfer of data IN (IN to host PC from USB-device)
+        int i=0;
+        for(i=0;i<10;i++){
+        transfer_out[i]  = libusb_alloc_transfer(0);
+        if(transfer_out[i]==NULL)
+                printf("oh nomem\n");
+        }
+
+
+         //single buffer ,async
+            libusb_fill_bulk_transfer( transfer_out[0], *dev_handle , BULK_INTERFACE5_EP1_IN_ADDR,
+            recvBuf,  DATA_TRANSFER_SIZE ,  // Note:  is where input data written.
+cb_out, (void *)transfer_out[0], 1000); //  user data   is the buffer. 
+retry_submit:            
+            return_code = libusb_submit_transfer(transfer_out[0]);
+
+        if (return_code != LIBUSB_SUCCESS) {
+//            printf("Failed reading data to bulk, return_code = %d\n", return_code);
+            goto retry_submit;
+   //         break;
+        }
+#endif
+           // allocate transfer of data IN (IN to host PC from USB-device)
+        int i=0;
+        for(i=0;i<10;i++){
+        transfer_out[i]  = libusb_alloc_transfer(0);
+        if(transfer_out[i]==NULL)
+                printf("oh nomem\n");
+        }     
+         //single buffer ,async
+            libusb_fill_bulk_transfer( transfer_out[0], *dev_handle , BULK_INTERFACE5_EP1_IN_ADDR,
+            recvBuf,  DATA_TRANSFER_SIZE ,  // Note:  is where input data written.
+cb_out, (void *)transfer_out[0], 1000); //  user data   is the buffer. 
+            return_code = libusb_submit_transfer(transfer_out[0]);
+
+        if (return_code != LIBUSB_SUCCESS) {
+//            printf("Failed reading data to bulk, return_code = %d\n", return_code);
+   //         break;
+        }        
+        while (!gkilled) {
+
+            return_code =  libusb_handle_events_completed(NULL, NULL);
+            if (return_code < 0){   // negative values are errors
+//                exitflag = out_deinit;
+                break;
+            }
+        }        
+	free(recvBuf);
+    return NULL;
+}
+
+/*
+   The sender thread for sending data
+ */
+void* sender_task(void *param)
+{
+    int i;   // Index for a loop
+    int return_code;   // Return value of each Prolific API
+	unsigned char *sendBuf = (unsigned char *)malloc(sizeof(char) * DATA_TRANSFER_SIZE);   // Buffer for sending data
+    int transferred_size = 0;   // Sent data in bytes
+//	unsigned int transferred_total_size = 0; // Total sent data in bytes
+    struct libusb_device_handle **dev_handle = (struct libusb_device_handle **)param;   /* Structure of
+		 the opened PL2701 device handle */
+    // Create the data pattern "sendBuf" to be sent to the receiver
+    for (i = 0; i < DATA_TRANSFER_SIZE; i++) {
+        sendBuf[i] = i % 0x100;
+    }
+
+    printf("Start to send the data\n");
+#if defined(_WIN32)	
+	start_time = GetTickCount();
+#elif defined(__linux__)
+    clock_gettime(CLOCK_REALTIME, &start_time);
+#elif defined(__APPLE__)
+	mach_timebase_info(&info);
+	start_time = mach_absolute_time();
+#endif
+    
+//async transfer.
+
+        // allocate transfer of data IN (IN to host PC from USB-device)
+        for(i=0;i<10;i++){
+        transfer_out[i]  = libusb_alloc_transfer(0);
+        if(transfer_out[i]==NULL)
+                printf("oh nomem\n");
+        }
+   
+        //we dont' use for, but use callback.
+#if 0
+        
+    // This thread send test pattern TRANSFER_ROUND_NO times
+    // one loop send 10 submit
+//    for (i = 0; i < TRANSFER_ROUND_NO && !gkilled; i+=10) {
+    for (i = 0; i < TRANSFER_ROUND_NO && !gkilled; i++) {
+#if 0
+//this is the sync transfer ,will block ,bad performance
+        transferred_size = 0;
+
+        // Send the data to the sender
+        return_code = libusb_bulk_transfer (
+                          *dev_handle,
+			              BULK_INTERFACE5_EP1_OUT_ADDR,
+                          sendBuf,
+                          DATA_TRANSFER_SIZE,
+                          &transferred_size,
+						  BULK_USB3_TIMEOUT
+                      );
+		transferred_total_size += transferred_size;
+#endif
+#if 0
+        //multi buffer;
+        int j=0;
+        for(j=0;j<10;j++){
+            libusb_fill_bulk_transfer( transfer_out[j], *dev_handle , BULK_INTERFACE5_EP1_OUT_ADDR ,
+            sendBuf,  DATA_TRANSFER_SIZE ,  // Note:  is where input data written.
+cb_out, (void *)transfer_out[j], 1000); //  user data   is the buffer. 
+            
+            return_code = libusb_submit_transfer(transfer_out[j]);
+
+        if (return_code != LIBUSB_SUCCESS) {
+            printf("Failed writing data to bulk, return_code = %d\n", return_code);
+            usleep(10000);
+   //         break;
+        }
+        //we push so many async request, kernel can not handle it .sleep it
+        }
+#endif
+        //single buffer ,async
+            libusb_fill_bulk_transfer( transfer_out[0], *dev_handle , BULK_INTERFACE5_EP1_OUT_ADDR ,
+            sendBuf,  DATA_TRANSFER_SIZE ,  // Note:  is where input data written.
+cb_out, (void *)transfer_out[0], 1000); //  user data   is the buffer. 
+retry_submit:            
+            return_code = libusb_submit_transfer(transfer_out[0]);
+
+        if (return_code != LIBUSB_SUCCESS) {
+//            printf("Failed writing data to bulk, return_code = %d\n", return_code);
+            goto retry_submit;
+   //         break;
+        }
+
+
+#if 0
+        if(i%10){
+        send_hi_sender(*dev_handle);
+        }
+#endif
+//        printf("transferd %d bytes \n",transferred_size);
+//        sleep(1);
+#if 0
+//we test receive.
+
+        	unsigned char *recvBuf = (unsigned char *)malloc(sizeof(char) * DATA_TRANSFER_SIZE);   // Buffer for receiving data
+
+    printf("Flush Endpoint IN FIFO first\n");
+    return_code = libusb_bulk_transfer(
+                      *dev_handle,
+		              BULK_INTERFACE5_EP1_IN_ADDR,
+                      recvBuf,
+		              1024,
+                      &transferred_size,
+		              BULK_USB3_TIMEOUT
+                  );
+            if (return_code != LIBUSB_SUCCESS) {
+            printf("Failed read data to bulk, return_code = %d\n", return_code);
+   //         break;
+        }
+
+        printf("recive %d bytes \n",transferred_size);
+#endif
+    }
+    //well, submit finished. now check complete
+    //
+//    if(1){
+        // This implementation uses a blocking call
+//        struct libusb_context *ctx = gdevice->ctx ;
+    //we used default context, so NULL
+#if 0
+    //move to thread
+        while (!gkilled) {
+
+            return_code =  libusb_handle_events_completed(NULL, NULL);
+            if (return_code < 0){   // negative values are errors
+//                exitflag = out_deinit;
+                break;
+            }
+        }
+#endif
+//}
+#endif
+
+        //single buffer ,async
+            libusb_fill_bulk_transfer( transfer_out[0], *dev_handle , BULK_INTERFACE5_EP1_OUT_ADDR ,
+            sendBuf,  DATA_TRANSFER_SIZE ,  // Note:  is where input data written.
+cb_out, (void *)transfer_out[0], 1000); //  user data   is the buffer. 
+            return_code = libusb_submit_transfer(transfer_out[0]);
+
+        if (return_code != LIBUSB_SUCCESS) {
+//            printf("Failed writing data to bulk, return_code = %d\n", return_code);
+   //         break;
+        }
+
+        
+        while (!gkilled) {
+
+            return_code =  libusb_handle_events_completed(NULL, NULL);
+            if (return_code < 0){   // negative values are errors
+//                exitflag = out_deinit;
+                break;
+            }
+        }
+        
+	free(sendBuf);
+    return NULL;
+}
+
+/*
+   Main routine
+ */
+int main(int argc, char* argv[])
+{
+    bool found_PL2701_device = false;   // TRUE means PL2701 was found
+    int i = 0;   // Indexes for the loops
+    libusb_device **devices;   // Structures representing all USB device detected on the system
+    libusb_device *device;   // Structure representing one USB device detected on the system
+    int return_code = 0;   // Return value from each libusb API
+    ssize_t no_of_devices;   // The number of devices in the device list
+#if !defined(_WIN32)
+    pthread_t thread;   // For thread creation
+#if 0
+    pthread_t thread_event;   // For thread creation
+#endif
+#endif
+    struct libusb_device_descriptor device_descriptor;   // structure represents the standard USB device descriptor
+    struct libusb_config_descriptor *config_desc = NULL;   // Structure represents the standard USB configuration descriptor
+    struct libusb_device_handle *dev_handle = NULL;   /* Structure represents the handles on a USB device */
+
+    // Check command parameters and Initialize the transmission
+    if (argc != 2) {
+        printf("Usage:\n\t%s [send/recv]\n", argv[0]);
+		return PL_ERROR_WRONG_PARA;
+    } else if (strcmp(argv[1], "send") == 0) {
+        gProgRole = PROGRAM_ROLE_SENDER;
+    } else if (strcmp(argv[1], "recv") == 0) {
+        gProgRole = PROGRAM_ROLE_RECEIVER;
+    } else {
+        printf("Usage:\n\t%s [send/recv]\n", argv[0]);
+        return PL_ERROR_WRONG_PARA;
+    }
+
+    // Register the signals to exit the program
+    signal(SIGINT, signal_handler);
+#if !defined(_WIN32)
+    signal(SIGKILL, signal_handler);
+    signal(SIGQUIT, signal_handler);
+    signal(SIGSTOP, signal_handler);
+#endif
+    signal(SIGILL, signal_handler);
+
+    // Initialize libusb
+    return_code = libusb_init(NULL);
+    if (return_code < LIBUSB_SUCCESS)
+        return return_code;
+
+    // Returns a list of USB devices currently attached to the system
+    no_of_devices = libusb_get_device_list(NULL, &devices);
+    if (no_of_devices < 1)
+        return PL_ERROR_WRONG_DEVICE_NO;
+
+    // printf("Found the folowing devices\n");
+    while((device = devices[i++]) != NULL) {
+        return_code = libusb_get_device_descriptor(device, &device_descriptor);
+        if(return_code < 0) {
+            fprintf(stderr, "Failed to get device descriptor");
+            return return_code;
+        }
+
+        // Find PL2701 USB device
+        if((PROLIFIC_VID == device_descriptor.idVendor) && (PL2701_PID == device_descriptor.idProduct)) {
+            found_PL2701_device = true;
+            DEBUG("(%s, %s(), L%d)\n", __FILE__, __FUNCTION__, __LINE__);
+            printf("Found PL2701 USB device!\n");
+
+            // Open a device and obtain a device handle
+            gdevice =  device ;
+            return_code = libusb_open(device, &dev_handle);
+            if(return_code < 0) {
+                DEBUG("(%s, %s(), L%d)\n", __FILE__, __FUNCTION__, __LINE__);
+                libusb_close(dev_handle);
+
+                return return_code;
+            }
+
+#if defined(__APPLE__)
+            // Get a USB configuration descriptor based on its index
+            return_code = libusb_get_config_descriptor(device, 0, &config_desc);
+#else
+            // Get the USB configuration descriptor for the currently active configuration
+            return_code = libusb_get_active_config_descriptor(device, &config_desc);
+#endif
+            if(return_code != 0) {
+                // Close a device handle
+                libusb_close(dev_handle);
+                continue;
+            }
+            DEBUG("(%s, %s(), L%d) config_desc->bNumInterfaces = %d\n",
+                  __FILE__, __FUNCTION__, __LINE__, config_desc->bNumInterfaces);
+        }
+    }
+
+    // Check whether any PL2701 USB device was found
+    if(!found_PL2701_device) {
+        printf("No PL2701 USB device was found!\n");
+        return PL_ERROR_NO_DEVICE;
+    }
+
+#if !defined(_WIN32)
+    // Check whether a kernel driver is attached to interface #0. If so, it need to be detached
+    /*
+    if(libusb_kernel_driver_active(dev_handle, g_bulk_interface_no))
+    {
+        return_code = libusb_detach_kernel_driver(dev_handle, g_bulk_interface_no);
+        DEBUG("(%s, %s(), L%d) return_code = %d\n", __FILE__, __FUNCTION__, __LINE__, return_code);
+    }
+*/
+    /*we try to detach all kernel drivers*/
+    int interface_no = config_desc->bNumInterfaces -1;
+   for ( interface_no = config_desc->bNumInterfaces -1; interface_no >=0 ;interface_no--)
+    {
+        printf("filtering interface %d\n",interface_no);
+        if(libusb_kernel_driver_active(dev_handle, interface_no)==1){
+        printf("detaching interface %d\n",interface_no);
+        return_code = libusb_detach_kernel_driver(dev_handle, interface_no);
+        DEBUG("(%s, %s(), L%d) return_code = %d\n", __FILE__, __FUNCTION__, __LINE__, return_code);
+        }
+    }
+#endif
+
+      return_code = libusb_set_configuration(dev_handle ,1);
+    DEBUG("(%s, %s(), L%d) return_code = %d\n", __FILE__, __FUNCTION__, __LINE__, return_code);
+
+    // Claim an interface on a given device handle
+    return_code = libusb_claim_interface(dev_handle, g_bulk_interface_no);
+    DEBUG("(%s, %s(), L%d) return_code = %d\n", __FILE__, __FUNCTION__, __LINE__, return_code);
+
+#if 0
+    /* Set alternate interface */
+    int alternate =1;
+           if ((return_code = libusb_set_interface_alt_setting(dev_handle, g_bulk_interface_no, alternate)) == LIBUSB_SUCCESS)
+           {
+              printf("%s: alternate interface %d set.\n", __FUNCTION__, alternate);
+              return -1;
+           }
+#endif           
+
+#if 0           
+           //get interface5 status size 2;
+           uint16_t dev_status;
+           memset((void *)&dev_status, 0xFF, 2);    
+           for(i=0;i<config_desc->bNumInterfaces;i++){
+               return_code = libusb_control_transfer(dev_handle, 0x81, 0x00, 0x00, 0x05, (unsigned char *)&dev_status, 2, 500);   
+               if (return_code < 2) {
+                   printf("Fail to get interface %d status %02d !\n",i,dev_status);
+                   return PL_ERROR_WRONG_STATUS;
+               }
+               printf("interface %d status %02d \n",i,dev_status);
+           }
+
+           //something after interface 2
+           //
+           uint8_t dev_status_8;
+               return_code = libusb_control_transfer(dev_handle, 0xA1, 0xFE, 0x00, 0x02, (unsigned char *)&dev_status_8, 1, 500);   
+                              if (return_code < 1) {
+                   return PL_ERROR_WRONG_STATUS;
+               }
+               printf("interface  status %02d \n",dev_status_8);
+
+
+
+//looks enable interface 4 report.
+
+               return_code = libusb_control_transfer(dev_handle, 0x21, 0x09, 0x20, 0x02, (unsigned char *)&dev_status, 2, 500);   
+                              if (return_code < 1) {
+                   return PL_ERROR_WRONG_STATUS;
+               }
+               printf("set interface 4 report %02d \n",dev_status);
+
+//some strange control 2
+//sometimes 0x8080,0x0280
+               return_code = libusb_control_transfer(dev_handle, 0x40, 0xe2, 0x8080, 0x1580, (unsigned char *)&dev_status, 2, 500);   
+                              if (return_code < 1) {
+                   return PL_ERROR_WRONG_STATUS;
+               }
+               printf("magic control %02d \n",dev_status);
+
+
+
+
+//some strange control
+               return_code = libusb_control_transfer(dev_handle, 0xC0, 0xf1, 0x00, 0x00, (unsigned char *)&dev_status, 2, 500);   
+                              if (return_code < 1) {
+                   return PL_ERROR_WRONG_STATUS;
+               }
+               printf("magic control %02d \n",dev_status);
+
+               
+#endif               
+
+
+ //some strange control ,may be magic reciver speed?
+//sometimes 0x8080,0x0280
+               uint16_t dev_status;
+               memset((void *)&dev_status, 0xFF, 2);
+               if (gProgRole == PROGRAM_ROLE_RECEIVER) {
+
+                   return_code = libusb_control_transfer(dev_handle, 0x40, 0xe1, 0x8080, 0x1580, (unsigned char *)&dev_status, 2, 500);   
+                   if (return_code < 1) {
+                       return PL_ERROR_WRONG_STATUS;
+                   }
+                   printf("magic reciver control %02d \n",dev_status);
+
+                   
+               memset((void *)&dev_status, 0xFF, 2);
+
+                   return_code = libusb_control_transfer(dev_handle, 0x40, 0xe1, 0x8080, 0x1580, (unsigned char *)&dev_status, 2, 500);   
+                   if (return_code < 1) {
+                       return PL_ERROR_WRONG_STATUS;
+                   }
+                   printf("magic reciver control %02d \n",dev_status);
+
+
+               }else{
+
+               memset((void *)&dev_status, 0xFF, 2);
+                   //some strange control ,may be magic sender speed?
+                   return_code = libusb_control_transfer(dev_handle, 0x40, 0xe2, 0x8080, 0x0280, (unsigned char *)&dev_status, 2, 500);   
+                   if (return_code < 1) {
+                       return PL_ERROR_WRONG_STATUS;
+                   }
+                   printf("magic sender control %02d \n",dev_status);
+
+                //some strange control ,may be magic sender speed?
+               memset((void *)&dev_status, 0xFF, 2);
+                   return_code = libusb_control_transfer(dev_handle, 0x40, 0xe1, 0x8080, 0x0280, (unsigned char *)&dev_status, 2, 500);   
+                   if (return_code < 1) {
+                       return PL_ERROR_WRONG_STATUS;
+                   }
+                   printf("magic sender control %02d \n",dev_status);
+               }
+
+               gdevice=device;
+
+
+#if 0           
+	// Check local and remote device statuses
+	DEV_STATUS dev_status;
+	memset((void *)&dev_status, 0xFF, sizeof(DEV_STATUS));
+	do {
+		// Get device statuses from vendor command
+		return_code = VENDOR_SPECIFIC_REQ_GET_STATUS(dev_handle, (unsigned char *)&dev_status);   
+		if (return_code < DEVICE_STATUS_LEN) {
+			printf("Fail to get PL2701 USB device status!\n");
+			return PL_ERROR_WRONG_STATUS;
+		}
+		printf("Local device status: %s, %s, %s\n", dev_status.localSuspend ? "Suspend" : "Active", 
+			dev_status.localAttached ? "Attached" : "Unplug", dev_status.localSpeed ? "Super speed" : "High speed");
+		printf("Remote device status: %s, %s, %s\n", dev_status.remoteSuspend ? "Suspend" : "Active",
+			dev_status.remoteAttached ? "Attached" : "Unplug", dev_status.remoteSpeed ? "Super speed" : "High speed");
+		// Break the loop when the remote device was attached
+		if (dev_status.remoteAttached)
+			break;
+		else {
+#if !defined(_WIN32)
+			usleep(SLEEP_TIME);
+#else
+			Sleep(SLEEP_TIME);
+#endif
+			continue;
+		}
+
+	} while (!gkilled);
+#endif
+
+
+
+
+
+#if defined(_WIN32)
+	// Run sender or receiver for data transfer
+	if (gProgRole == PROGRAM_ROLE_RECEIVER) {
+		// Run receiver's function
+		receiver_task((void*)&dev_handle);
+	}
+	else if (gProgRole == PROGRAM_ROLE_SENDER) {
+		// Run sender's function
+		sender_task((void*)&dev_handle);
+	}
+#else
+    // Create one sender and one receiver for data transfer
+    if (gProgRole == PROGRAM_ROLE_RECEIVER) {
+        // Create a thread to run sender's task.
+        return_code = pthread_create(&thread, NULL, receiver_task, (void*) &dev_handle);
+        if (return_code != 0) {
+            printf("Unable to create sender thread.\n");
+            return -1;
+        }
+#if 0
+        return_code = pthread_create(&thread_event, NULL, event_task, (void*) &dev_handle);
+        if (return_code != 0) {
+            printf("Unable to create receiver thread.\n");
+            return -1;
+        }        
+
+        pthread_join(thread_event, NULL);
+#endif
+        pthread_join(thread, NULL);
+
+    } else if (gProgRole == PROGRAM_ROLE_SENDER) {
+        // Create a thread to run receiver's task.
+        return_code = pthread_create(&thread, NULL, sender_task, (void*) &dev_handle);
+        if (return_code != 0) {
+            printf("Unable to create receiver thread.\n");
+            return -1;
+        }
+#if 0
+        return_code = pthread_create(&thread_event, NULL, event_task, (void*) &dev_handle);
+        if (return_code != 0) {
+            printf("Unable to create receiver thread.\n");
+            return -1;
+        }
+
+        pthread_join(thread_event, NULL);
+#endif
+        pthread_join(thread, NULL);
+    }
+#endif
+    // Frees a list of devices previously discovered using libusb_get_device_list()
+    libusb_free_device_list(devices, 1);
+
+    // Exit libusb
+    libusb_exit(NULL);
+    return PL_ERROR_SUCCESS;
+}
